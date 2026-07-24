@@ -140,8 +140,17 @@ document.addEventListener("DOMContentLoaded", () => {
   function getParams(){const s=decodeServersParam(); if(s?.servers?.[activeServerIndex])return s.servers[activeServerIndex]; return {url:get("url"),title:get("title")||"BSR Player",ck:get("ck"),ref:get("ref"),ua:get("ua")||navigator.userAgent};}
   const isMpd=u=>(u||"").toLowerCase().includes(".mpd");
   const isMp4=u=>(u||"").toLowerCase().includes(".mp4");
-  const isHls=u=>{u=(u||"").toLowerCase();return u.includes(".m3u8")||u.includes(".png")||u.includes("#hls")||u.includes(".json")};
-  const proxyUrl=(u,ref,ua)=>{const p=new URLSearchParams();p.set("url",u.replace("#hls",""));p.set("ua",ua||navigator.userAgent);try{const x=new URL(u.replace("#hls",""));p.set("ref",ref||x.origin+"/")}catch{}return WORKER+"?"+p.toString()};
+  const isHls=u=>{u=(u||"").toLowerCase();return u.includes(".m3u8")||u.includes(".png")||u.includes("#hls")||u.includes(".json")||u.includes(".ts")};
+
+  /* تسريع تحويل البارامترات والترميز الفوري لـ Referer و User-Agent */
+  const proxyUrl=(u,ref,ua)=>{
+    const cleanUrl = u.replace("#hls","");
+    let refUrl = ref;
+    if(!refUrl){
+      try { refUrl = new URL(cleanUrl).origin + "/"; } catch { refUrl = ""; }
+    }
+    return `${WORKER}?url=${encodeURIComponent(cleanUrl)}&ref=${encodeURIComponent(refUrl)}&ua=${encodeURIComponent(ua||navigator.userAgent)}`;
+  };
   const finalUrl=p=>(isMpd(p.url)||isMp4(p.url)?p.url:proxyUrl(p.url,p.ref,p.ua));
 
   async function forceMobileFullscreen(){
@@ -183,7 +192,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
       if(isMp4(p.url)){
         video.src = src;
-        video.load();
         loading.style.display="none";
         await startVideoAfterLoad();
         return;
@@ -191,16 +199,70 @@ document.addEventListener("DOMContentLoaded", () => {
 
       if(isMpd(p.url)){
         shaka.polyfill.installAll(); shakaPlayer=new shaka.Player(video);
+        
+        shakaPlayer.configure({
+          streaming: {
+            bufferingGoal: 3,
+            rebufferingGoal: 1,
+            bufferBehind: 10,
+            lowLatencyMode: true,
+            fastSwitchEnabled: true,
+            jumpLargeGaps: true
+          },
+          manifest: {
+            retryParameters: { maxAttempts: 2, baseDelay: 50, backoffFactor: 1.1 }
+          }
+        });
+
         if(p.ck&&p.ck.includes(":")){const [kid,key]=p.ck.split(":");shakaPlayer.configure({drm:{clearKeys:{[kid.trim()]:key.trim()}}})}
-        const net=shakaPlayer.getNetworkingEngine(); if(net){net.registerRequestFilter((type,req)=>{if(p.ua)req.headers["User-Agent"]=p.ua;if(p.ref)req.headers["Referer"]=p.ref})}
+        
+        /* إرسال مباشر وسريع جداً للهيدرات (UA & Referer) داخل طلبات الشاكا */
+        const net=shakaPlayer.getNetworkingEngine(); 
+        if(net){
+          net.registerRequestFilter((type,req)=>{
+            if(p.ua) req.headers["User-Agent"]=p.ua;
+            if(p.ref) req.headers["Referer"]=p.ref;
+          });
+        }
         shakaPlayer.addEventListener("error",e=>{errTitle.textContent="خطأ MPD";errMsg.textContent=e.detail?.message||"تعذر تشغيل MPD";errorBox.style.display="flex"});
         await shakaPlayer.load(src); loading.style.display="none"; await startVideoAfterLoad();
       }else{
         if(Hls.isSupported()){
-          hls=new Hls({enableWorker:true,lowLatencyMode:false,maxBufferLength:30,backBufferLength:90,liveSyncDuration:4});hls.loadSource(src);hls.attachMedia(video);
-          hls.on(Hls.Events.MANIFEST_PARSED,async()=>{loading.style.display="none";await startVideoAfterLoad()});
+          /* إعدادات تمرير الـ Headers بسرعة البرق ومباشرة للبروكسي مع استجابة فورية */
+          hls=new Hls({
+            enableWorker: true,
+            lowLatencyMode: true,
+            maxBufferLength: 6,
+            maxMaxBufferLength: 12,
+            maxBufferSize: 20 * 1024 * 1024,
+            maxBufferHole: 0.3,
+            liveSyncDurationCount: 1,
+            liveMaxLatencyDurationCount: 2,
+            startLevel: -1,
+            capLevelToPlayerSize: true,
+            progressive: true,
+            manifestLoadingTimeOut: 2500,
+            manifestLoadingMaxRetry: 2,
+            levelLoadingTimeOut: 2500,
+            levelLoadingMaxRetry: 2,
+            fragLoadingTimeOut: 3000,
+            fragLoadingMaxRetry: 2,
+            xhrSetup: function(xhr) {
+              /* حقن الهيدرات مباشرة للتأكد من المرور السريع */
+              if(p.ref) xhr.setRequestHeader('X-Referer', p.ref);
+              if(p.ua) xhr.setRequestHeader('X-User-Agent', p.ua);
+            }
+          });
+          
+          hls.loadSource(src);hls.attachMedia(video);
+          
+          hls.on(Hls.Events.MEDIA_ATTACHED, async () => {
+            loading.style.display="none";
+            await startVideoAfterLoad();
+          });
+
           hls.on(Hls.Events.ERROR,(_,data)=>{if(data.fatal){if(data.type===Hls.ErrorTypes.NETWORK_ERROR)hls.startLoad();else if(data.type===Hls.ErrorTypes.MEDIA_ERROR)hls.recoverMediaError();else{errTitle.textContent="خطأ HLS";errMsg.textContent=data.details||"تعذر التشغيل";errorBox.style.display="flex"}}});
-        }else{video.src=src;video.load();loading.style.display="none";await startVideoAfterLoad()}
+        }else{video.src=src;loading.style.display="none";await startVideoAfterLoad()}
       }
     }catch(e){errTitle.textContent="فشل التشغيل";errMsg.textContent=e.message||String(e);errorBox.style.display="flex"}
   }
